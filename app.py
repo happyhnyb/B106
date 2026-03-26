@@ -65,19 +65,23 @@ C = {
     "card_bg": "#0E1B2B",
 }
 
+# FIX: Moved colorway out of PLOTLY_LAYOUT so it isn't re-applied via
+# update_layout() and doesn't overwrite per-figure colour settings.
+PLOTLY_COLORWAY = [
+    C["primary"],
+    C["secondary"],
+    C["accent"],
+    C["neutral"],
+    "#9B5FBF",
+    "#E5C84A",
+    "#3DB5B5",
+]
+
 PLOTLY_LAYOUT = dict(
     font=dict(family="Inter, sans-serif", color="#EAEFF5"),
     paper_bgcolor=C["bg"],
     plot_bgcolor="#0E1B2B",
-    colorway=[
-        C["primary"],
-        C["secondary"],
-        C["accent"],
-        C["neutral"],
-        "#9B5FBF",
-        "#E5C84A",
-        "#3DB5B5",
-    ],
+    # colorway intentionally omitted here — set per-figure or via template
     title=dict(font=dict(size=15, color="#EAEFF5"), x=0.02),
     xaxis=dict(gridcolor="#223247", linecolor="#2B3D52", showgrid=True),
     yaxis=dict(gridcolor="#223247", linecolor="#2B3D52", showgrid=True),
@@ -207,15 +211,22 @@ def has_cols(df: pd.DataFrame, cols: list[str]) -> bool:
     return all(col in df.columns for col in cols)
 
 
+# FIX: Expanded mapping to handle float representations (1.0, 0.0) that
+# Inside Airbnb CSVs commonly produce after pd.read_csv parses boolean columns.
 def clean_bool_col(series: pd.Series) -> pd.Series:
-    mapping = {
-        "t": True, "f": False,
-        "true": True, "false": False,
-        "True": True, "False": False,
-        True: True, False: False,
-        1: True, 0: False,
-    }
-    return series.map(mapping)
+    def _map(v):
+        if v is True or v == 1 or v == 1.0:
+            return True
+        if v is False or v == 0 or v == 0.0:
+            return False
+        if isinstance(v, str):
+            low = v.strip().lower()
+            if low == "t" or low == "true":
+                return True
+            if low == "f" or low == "false":
+                return False
+        return np.nan
+    return series.apply(_map)
 
 
 def show_generic_data_error():
@@ -237,6 +248,8 @@ def load_and_clean_from_path(path: str) -> pd.DataFrame:
     return clean_dataframe(df)
 
 
+# FIX: Accept the raw bytes directly so cache key is stable across re-runs
+# without calling getvalue() outside the cached function.
 @st.cache_data(show_spinner=False)
 def load_and_clean_from_upload(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     from io import BytesIO
@@ -250,14 +263,11 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if "price" not in df.columns:
         raise ValueError("The dataset must contain a 'price' column.")
 
-    df["price"] = (
-        df["price"]
-        .astype(str)
-        .str.replace(r"[\$,]", "", regex=True)
-        .str.strip()
-        .replace({"nan": np.nan, "None": np.nan, "": np.nan})
-    )
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    # FIX: Convert to str only once, then clean — avoids double-conversion
+    # issues and ensures "nan" / "None" strings are caught before to_numeric.
+    price_str = df["price"].astype(str).str.replace(r"[\$,]", "", regex=True).str.strip()
+    price_str = price_str.replace({"nan": np.nan, "None": np.nan, "": np.nan, "NaN": np.nan})
+    df["price"] = pd.to_numeric(price_str, errors="coerce")
     df = df.dropna(subset=["price"]).copy()
     df = df[df["price"] > 0].copy()
 
@@ -279,16 +289,19 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
+    # FIX: Rate columns may already be floats (0.0–1.0) in some dataset
+    # versions instead of "97%" strings. Detect which format and normalise
+    # to a 0–100 float consistently.
     for col in ["host_response_rate", "host_acceptance_rate"]:
         if col in df.columns:
-            df[col] = (
-                df[col]
-                .astype(str)
-                .str.replace("%", "", regex=False)
-                .str.strip()
-                .replace({"nan": np.nan, "None": np.nan, "": np.nan})
-            )
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            raw = df[col].astype(str).str.replace("%", "", regex=False).str.strip()
+            raw = raw.replace({"nan": np.nan, "None": np.nan, "": np.nan, "NaN": np.nan})
+            numeric = pd.to_numeric(raw, errors="coerce")
+            # Values ≤ 1.0 are proportions (0.0–1.0); scale to 0–100
+            is_proportion = numeric.dropna().lt(1.01).all()
+            if is_proportion:
+                numeric = numeric * 100
+            df[col] = numeric
 
     numeric_cols = [
         "reviews_per_month",
@@ -449,6 +462,8 @@ with st.sidebar:
         st.caption("Dataset: Inside Airbnb Berlin")
         st.caption("Course: B106 Data Visualisation")
     else:
+        # FIX: Always define filter variables so apply_filters() never
+        # references an unbound name when data_ok is False.
         selected_neighbourhoods = []
         selected_room_types = []
         price_range = (0, 999999)
@@ -470,10 +485,12 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     if selected_room_types:
         mask &= df["room_type"].isin(selected_room_types)
 
+    # FIX: Use .eq() instead of == True to correctly handle pandas nullable
+    # boolean dtype (BooleanDtype) without raising ambiguity errors.
     if superhost_filter == "Superhost only" and "host_is_superhost" in df.columns:
-        mask &= df["host_is_superhost"] == True
+        mask &= df["host_is_superhost"].eq(True)
     elif superhost_filter == "Regular hosts only" and "host_is_superhost" in df.columns:
-        mask &= df["host_is_superhost"] == False
+        mask &= df["host_is_superhost"].eq(False)
 
     return df.loc[mask].copy()
 
@@ -513,6 +530,7 @@ tabs = st.tabs([
     "🔍 Insight Shortlist",
 ])
 
+# ── Tab 0: Overview ──────────────────────────────────────────────────────────
 with tabs[0]:
     st.markdown('<p class="section-header">Market Snapshot</p>', unsafe_allow_html=True)
 
@@ -583,6 +601,7 @@ with tabs[0]:
         fig_room.update_layout(showlegend=False)
         safe_plot(fig_room, 360)
 
+# ── Tab 1: Neighbourhoods ────────────────────────────────────────────────────
 with tabs[1]:
     st.markdown('<p class="section-header">Neighbourhood Analysis</p>', unsafe_allow_html=True)
 
@@ -619,12 +638,16 @@ with tabs[1]:
     fig_neigh.update_coloraxes(showscale=False)
     safe_plot(fig_neigh, 520)
 
+# ── Tab 2: Listing Characteristics ───────────────────────────────────────────
 with tabs[2]:
     st.markdown('<p class="section-header">Listing Characteristics</p>', unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
 
     with c1:
+        # FIX: Use points=False instead of points="outliers" — "outliers" can
+        # silently fail in some Plotly versions when the column has many NaN
+        # values; False is always safe and renders faster on large datasets.
         fig_box = px.box(
             df,
             x="room_type",
@@ -633,16 +656,20 @@ with tabs[2]:
             title="Price Distribution by Room Type",
             labels={"price": "Nightly price (€)", "room_type": ""},
             color_discrete_sequence=[C["primary"], C["secondary"], C["accent"], C["neutral"]],
-            points="outliers",
+            points=False,
         )
         fig_box.update_traces(boxmean=True)
         fig_box.update_layout(showlegend=False)
         safe_plot(fig_box, 400)
 
     with c2:
+        # FIX: Added explicit NaN drop before between() so the filter doesn't
+        # silently discard everything; added a fallback message when the column
+        # is missing or the filtered result is empty.
         if "accommodates" in df.columns:
             cap_df = df.copy()
             cap_df["accommodates"] = pd.to_numeric(cap_df["accommodates"], errors="coerce")
+            cap_df = cap_df.dropna(subset=["accommodates"])
             cap_agg = (
                 cap_df[cap_df["accommodates"].between(1, 10, inclusive="both")]
                 .groupby("accommodates")["price"]
@@ -660,7 +687,12 @@ with tabs[2]:
                     color_discrete_sequence=[C["primary"]],
                 )
                 safe_plot(fig_cap, 400)
+            else:
+                st.info("Not enough capacity data available for the current selection.")
+        else:
+            st.info("Column `accommodates` is not present in this dataset.")
 
+# ── Tab 3: Pricing & Demand ───────────────────────────────────────────────────
 with tabs[3]:
     st.markdown('<p class="section-header">Pricing & Demand Signals</p>', unsafe_allow_html=True)
 
@@ -690,7 +722,15 @@ with tabs[3]:
         )
         fig_sc.update_traces(marker_size=5)
         safe_plot(fig_sc, 420)
+    else:
+        # FIX: Previously this tab was completely blank when no availability
+        # column existed — now it shows a clear explanation.
+        st.info(
+            "No availability column found in this dataset. "
+            "Expected one of: `availability_365`, `availability_90`, or `availability_30`."
+        )
 
+# ── Tab 4: Host Concentration ─────────────────────────────────────────────────
 with tabs[4]:
     st.markdown('<p class="section-header">Host Concentration Analysis</p>', unsafe_allow_html=True)
 
@@ -728,9 +768,108 @@ with tabs[4]:
     )
     safe_plot(fig_hc, 480)
 
+# ── Tab 5: Insight Shortlist ──────────────────────────────────────────────────
 with tabs[5]:
     st.markdown('<p class="section-header">Final Insight Shortlist</p>', unsafe_allow_html=True)
-    st.info(
-        "Upload the Berlin Inside Airbnb dataset or include it in your repo, "
-        "and this dashboard will work on Streamlit Cloud."
+
+    # FIX: Was just a static info string. Now dynamically computes real insights
+    # from the filtered dataframe so the tab is actually useful.
+
+    # --- Compute insights ---
+    top_neigh_price = (
+        df.groupby("neighbourhood_cleansed")["price"]
+        .median()
+        .sort_values(ascending=False)
     )
+    priciest_neigh = top_neigh_price.index[0] if len(top_neigh_price) else "N/A"
+    priciest_price = top_neigh_price.iloc[0] if len(top_neigh_price) else 0
+
+    cheapest_neigh = top_neigh_price.index[-1] if len(top_neigh_price) else "N/A"
+    cheapest_price = top_neigh_price.iloc[-1] if len(top_neigh_price) else 0
+
+    multi_pct = (df["host_type"] == "Multi-listing").mean() * 100
+
+    most_common_room = df["room_type"].value_counts().index[0] if len(df) else "N/A"
+    most_common_room_pct = df["room_type"].value_counts(normalize=True).iloc[0] * 100 if len(df) else 0
+
+    superhost_median = df[df["host_is_superhost"].eq(True)]["price"].median() if "host_is_superhost" in df.columns else None
+    regular_median = df[df["host_is_superhost"].eq(False)]["price"].median() if "host_is_superhost" in df.columns else None
+
+    high_demand = df[df["reviews_per_month"] > df["reviews_per_month"].quantile(0.75)]
+    high_demand_room = high_demand["room_type"].value_counts().index[0] if len(high_demand) else "N/A"
+
+    insights = [
+        {
+            "icon": "💰",
+            "title": "Priciest neighbourhood",
+            "body": (
+                f"**{priciest_neigh}** commands the highest median nightly rate at "
+                f"**€{priciest_price:.0f}**, compared to **€{cheapest_price:.0f}** "
+                f"in the most affordable neighbourhood (**{cheapest_neigh}**)."
+            ),
+        },
+        {
+            "icon": "🏢",
+            "title": "Professional host concentration",
+            "body": (
+                f"**{multi_pct:.1f}%** of listings belong to multi-listing hosts, "
+                "suggesting a significant share of the market is operated commercially "
+                "rather than by individual home-sharers."
+            ),
+        },
+        {
+            "icon": "🛏️",
+            "title": "Dominant listing type",
+            "body": (
+                f"**{most_common_room}** is the most common room type, "
+                f"accounting for **{most_common_room_pct:.1f}%** of all listings in "
+                "the current selection."
+            ),
+        },
+        {
+            "icon": "⭐",
+            "title": "Superhost price premium",
+            "body": (
+                (
+                    f"Superhosts charge a median of **€{superhost_median:.0f}/night** vs "
+                    f"**€{regular_median:.0f}/night** for regular hosts — a "
+                    f"**{abs(superhost_median - regular_median):.0f}€ difference** "
+                    f"({'premium' if superhost_median > regular_median else 'discount'})."
+                )
+                if superhost_median is not None and regular_median is not None
+                and not (pd.isna(superhost_median) or pd.isna(regular_median))
+                else "Superhost data is not available for the current selection."
+            ),
+        },
+        {
+            "icon": "📈",
+            "title": "High-demand listing type",
+            "body": (
+                f"Among the top 25% most-reviewed listings (a proxy for booking frequency), "
+                f"**{high_demand_room}** is the most prevalent room type — suggesting "
+                "guests favour this category."
+            ),
+        },
+        {
+            "icon": "📊",
+            "title": "Price spread",
+            "body": (
+                f"Nightly prices range from **€{df['price'].quantile(0.05):.0f}** (5th percentile) "
+                f"to **€{df['price'].quantile(0.95):.0f}** (95th percentile), "
+                f"with a median of **€{df['price'].median():.0f}** — "
+                "indicating a wide spread driven by neighbourhood and room type."
+            ),
+        },
+    ]
+
+    for ins in insights:
+        with st.container():
+            st.markdown(
+                f"""
+                <div class="kpi-card" style="margin-bottom:12px;">
+                    <div style="font-size:1.3rem; margin-bottom:6px;">{ins['icon']} <strong style="font-size:0.95rem; color:#C8D8E8;">{ins['title']}</strong></div>
+                    <div style="font-size:0.88rem; color:#B0C4D8; line-height:1.55;">{ins['body']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
